@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import Fastify from 'fastify';
 
 import items from 'data/items.json' with { type: 'json' };
@@ -22,8 +23,38 @@ fastify.use((_, __, next) =>
 // Настройка CORS
 fastify.use((_, reply, next) => {
   reply.setHeader('Access-Control-Allow-Origin', '*');
+  reply.setHeader('Access-Control-Allow-Methods', 'GET,POST,PUT,OPTIONS');
+  reply.setHeader('Access-Control-Allow-Headers', 'Content-Type');
   next();
 });
+
+fastify.options('/*', (_request, reply) => {
+  reply.status(204).send();
+});
+
+async function askOllama(prompt: string): Promise<string> {
+  const baseUrl = process.env.OLLAMA_URL ?? 'http://127.0.0.1:11434';
+  const model = process.env.OLLAMA_MODEL ?? 'qwen2.5:3b';
+
+  const response = await fetch(`${baseUrl}/api/generate`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model,
+      prompt,
+      stream: false,
+    }),
+  });
+
+  if (!response.ok) {
+    throw new Error('Ollama request failed');
+  }
+
+  const data = (await response.json()) as { response?: string };
+  return (data.response ?? '').trim();
+}
 
 interface ItemGetRequest extends Fastify.RequestGenericInterface {
   Params: {
@@ -105,6 +136,7 @@ fastify.get<ItemsGetRequest>('/items', request => {
       })
       .slice(skip, skip + limit)
       .map(item => ({
+        id: item.id,
         category: item.category,
         title: item.title,
         price: item.price,
@@ -163,13 +195,110 @@ fastify.put<ItemUpdateRequest>('/items/:id', (request, reply) => {
   }
 });
 
-const port = Number(process.env.port) ?? 8080;
+interface AiDescriptionRequest extends Fastify.RequestGenericInterface {
+  Body: {
+    category: string;
+    title: string;
+    price?: number;
+    description?: string;
+    params?: Record<string, unknown>;
+  };
+}
 
-fastify.listen({ port }, function (err, _address) {
+fastify.post<AiDescriptionRequest>('/ai/description', async (request, reply) => {
+  const body = (request.body ?? {}) as AiDescriptionRequest['Body'];
+  const title = String(body.title ?? '').trim();
+  const category = String(body.category ?? '').trim();
+  const price = Number(body.price);
+  const params = body.params ?? {};
+  const description = String(body.description ?? '').trim();
+
+  if (!title || !category) {
+    reply.status(400).send({ success: false, error: 'title and category are required' });
+    return;
+  }
+
+  const prompt = [
+    'Ты помогаешь писать тексты объявлений на русском языке.',
+    'Сгенерируй короткое и понятное описание объявления (2-4 предложения).',
+    'Без эмодзи, без markdown, без списков.',
+    `Категория: ${category}`,
+    `Название: ${title}`,
+    `Цена: ${Number.isFinite(price) ? String(price) : 'не указана'}`,
+    `Характеристики: ${JSON.stringify(params)}`,
+    `Текущее описание: ${description || 'отсутствует'}`,
+    'Верни только готовый текст описания.',
+  ].join('\n');
+
+  try {
+    const generatedDescription = await askOllama(prompt);
+    return { success: true, description: generatedDescription };
+  } catch (error) {
+    request.log.error(error);
+    reply.status(500).send({ success: false, error: 'Не удалось получить ответ от Ollama' });
+  }
+});
+
+interface AiPriceRequest extends Fastify.RequestGenericInterface {
+  Body: {
+    category: string;
+    title: string;
+    description?: string;
+    params?: Record<string, unknown>;
+    price?: number;
+  };
+}
+
+fastify.post<AiPriceRequest>('/ai/price', async (request, reply) => {
+  const body = (request.body ?? {}) as AiPriceRequest['Body'];
+  const title = String(body.title ?? '').trim();
+  const category = String(body.category ?? '').trim();
+  const params = body.params ?? {};
+  const description = String(body.description ?? '').trim();
+  const currentPrice = Number(body.price);
+
+  if (!title || !category) {
+    reply.status(400).send({ success: false, error: 'title and category are required' });
+    return;
+  }
+
+  const prompt = [
+    'Ты оцениваешь рыночную цену объявлений в рублях.',
+    'Верни только одно целое число без валюты и без пояснений.',
+    `Категория: ${category}`,
+    `Название: ${title}`,
+    `Текущая цена: ${Number.isFinite(currentPrice) ? String(currentPrice) : 'не указана'}`,
+    `Характеристики: ${JSON.stringify(params)}`,
+    `Описание: ${description || 'отсутствует'}`,
+  ].join('\n');
+
+  try {
+    const rawPrice = await askOllama(prompt);
+    const digitsOnly = rawPrice.replace(/[^\d]/g, '');
+    const suggestedPrice = Number(digitsOnly);
+
+    if (!Number.isFinite(suggestedPrice) || suggestedPrice <= 0) {
+      reply.status(422).send({ success: false, error: 'Некорректная цена от модели' });
+      return;
+    }
+
+    return { success: true, price: suggestedPrice };
+  } catch (error) {
+    request.log.error(error);
+    reply.status(500).send({ success: false, error: 'Не удалось получить ответ от Ollama' });
+  }
+});
+
+// const port = Number(process.env.port) ?? 8080;
+const parsedPort = Number(process.env.PORT);
+const port = Number.isInteger(parsedPort) ? parsedPort : 8080;
+const host = process.env.HOST ?? '0.0.0.0';
+
+fastify.listen({ port, host }, function (err, _address) {
   if (err) {
     fastify.log.error(err);
     process.exit(1);
   }
 
-  fastify.log.debug(`Server is listening on port ${port}`);
+  fastify.log.debug(`Server is listening on ${host}:${port}`);
 });
